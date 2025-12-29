@@ -1,0 +1,209 @@
+# Setup
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(knitr)
+  library(ggplot2)
+  library(gridExtra)
+  library(igraph)
+  library(Matrix)
+})
+```
+
+```{r}
+# SIS Simulation Function
+simulate_sis_vec <- function(graph, p0, beta, gamma, steps) {
+  n_nodes <- vcount(graph)
+  status <- rbinom(n_nodes, 1, p0) 
+  infected_history <- numeric(steps)
+  adj <- as_adj(graph, sparse = TRUE) 
+  
+  for (t in 1:steps) {
+    infected_history[t] <- mean(status)
+    
+    stays_infected <- (status == 1) & (runif(n_nodes) >= gamma)
+    
+    infected_neighbors <- as.numeric(adj %*% status)
+    prob_infection <- 1 - (1 - beta)^infected_neighbors  
+    
+    becomes_infected <- (status == 0) & (runif(n_nodes) < prob_infection)
+    
+    status <- as.integer(stays_infected | becomes_infected)
+  }
+  return(infected_history)
+}
+```
+
+# Parameters
+```{r}
+set.seed(123)
+
+n <- 1000
+p0 <- 0.1             # Initial infected fraction
+beta <- 0.06          # Probability of infection
+gamma <- 0.40         # Probability of recovery
+time_steps <- 100     # Duration of simulation
+
+# Network Generation
+networks <- list(
+  ER = erdos.renyi.game(n, p = 0.012),             # Avg degree ~12
+  BA = barabasi.game(n, m = 6, directed = FALSE),  # Avg degree ~12
+  WS = watts.strogatz.game(dim = 1, size = n, nei = 6, p = 0.1),
+  Complete = make_full_graph(n),
+  Star = make_star(n, mode = "undirected")
+)
+
+df_eigen <- lapply(names(networks), function(name) {
+  g <- networks[[name]]
+  lambda1 <- Re(eigen(as_adj(g), only.values = TRUE)$values[1])
+  thresh <- gamma / lambda1
+  data.frame(
+    Network = name,
+    Lambda1 = round(lambda1, 3),
+    Threshold_Beta = round(thresh, 4),
+    Is_Epidemic_Likely = ifelse(beta > thresh, "YES", "NO")
+  )
+}) %>% bind_rows() %>% arrange(desc(Lambda1))
+
+print(kable(df_eigen))
+```
+
+# Task 1: Spread
+
+```{r}
+N_runs_task1 <- 30
+df_task1 <- lapply(names(networks), function(net_name) {
+  history <- simulate_sis_vec(networks[[net_name]], p0, beta, gamma, time_steps)
+  data.frame(
+    Time = 1:time_steps,
+    Prevalence = history,
+    Network = net_name
+  )
+}) %>% bind_rows()
+
+p1 <- ggplot(df_task1, aes(x = Time, y = Prevalence, color = Network)) +
+  geom_line(size = 1) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "SIS Epidemic Spread by Topology",
+    y = "Proportion Infected",
+    x = "Time Step"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 10),
+    axis.title.x = element_text(margin = margin(t = 10), face = "bold"),
+    axis.title.y = element_text(margin = margin(r = 10), face = "bold"),
+    axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 1, size = 9),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = "bottom"
+  )
+print(p1)
+```
+
+```{r}
+N_runs <- 30
+beta_values <- seq(0, 0.10, by=0.01)
+sweep_steps <- 200
+
+results_sweep <- lapply(names(networks), function(net_name) {
+  g <- networks[[net_name]]
+  
+  lapply(beta_values, function(b) {
+    final_states <- replicate(N_runs, tail(simulate_sis_vec(g, p0, b, gamma, sweep_steps), 1))
+    
+    data.frame(
+      Network = net_name,
+      Beta = b,
+      Prevalence = final_states
+    )
+  }) %>% bind_rows()
+}) %>% bind_rows()
+
+p_sweep <- ggplot(results_sweep, aes(x = Beta, y = Prevalence)) +
+  geom_boxplot(aes(fill = Network, group = Beta), 
+               outlier.shape = 21, outlier.size = 1.5, 
+               outlier.alpha = 0.6, lwd = 0.4, width = 0.008, color = "gray20") +
+  
+  geom_vline(data = df_eigen, aes(xintercept = Threshold_Beta), 
+             linetype = "dashed", color = "red", size = 0.8, alpha = 0.8) +
+  
+  facet_wrap(~Network, ncol = 3) +
+  scale_fill_brewer(palette = "Set1") +
+  
+  labs(
+    y = "Final Proportion Infected",
+    x = expression(bold("Infection Probability") ~ (beta))
+    ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = seq(0, 0.10, by = 0.02)) +
+  
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 10),
+    axis.title.x = element_text(margin = margin(t = 10), face = "bold"),
+    axis.title.y = element_text(margin = margin(r = 10), face = "bold"),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 9),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = "none"
+  )
+
+print(p_sweep)
+```
+
+
+
+
+```{r}
+df_task2 <- lapply(names(networks), function(name) {
+  beta_c <- df_eigen$Threshold_Beta[df_eigen$Network == name]
+  
+  b_low  <- beta_c * 0.90
+  b_high <- min(beta_c * 1.3, 1.0) 
+  
+  sim_low  <- simulate_sis_vec(networks[[name]], p0, b_low, gamma, time_steps)
+  sim_high <- simulate_sis_vec(networks[[name]], p0, b_high, gamma, time_steps)
+  
+  bind_rows(
+    data.frame(Time = 1:time_steps, Prevalence = sim_low,  Type = "Below Threshold (0.9x)"),
+    data.frame(Time = 1:time_steps, Prevalence = sim_high, Type = "Above Threshold (1.3x)")
+  ) %>% mutate(
+    Network = name,
+    Label = paste0(name, "\nThresh ~ ", beta_c)
+  )
+}) %>% bind_rows()
+
+
+ordered_labels <- unique(df_task2$Label[order(match(df_task2$Network, df_eigen$Network))])
+df_task2$Label <- factor(df_task2$Label, levels = ordered_labels)
+
+p2 <- ggplot(df_task2, aes(x = Time, y = Prevalence, color = Type)) +
+  geom_line(size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~Label, scales = "free_y", ncol = 3) +
+  scale_color_manual(values = c("firebrick", "steelblue")) +
+  labs(
+    y = "Proportion Infected",
+    color = "Condition"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 10),
+    
+    axis.title.x = element_text(margin = margin(t = 10), face = "bold"),
+    axis.title.y = element_text(margin = margin(r = 10), face = "bold"),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 9),
+    
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(), 
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = "bottom"
+  )
+
+print(p2)
+
+```
